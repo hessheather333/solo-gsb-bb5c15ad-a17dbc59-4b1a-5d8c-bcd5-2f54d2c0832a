@@ -9,6 +9,7 @@ GET    /api/analyses/{id}                    fetch one version with the full res
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
 GET    /api/analyses/{id}/findings           query findings (filters: severity/behavioral_only)
 GET    /api/analyses/{id}/decision-map       CIDR decision map of this version (query: cidr)
+GET    /api/analyses/{id}/redundant-rules    per-rule removability inventory (recomputed LPM diff)
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
 POST   /api/analyses/{id}/change-guard/{oid} authorize the semantic diff against caller-supplied grants
@@ -31,6 +32,7 @@ from . import db
 from .change_guard import ChangeGuardError, guard_changes, parse_guard_entries
 from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
+from .redundant import redundant_rule_inventory
 from .schemas import AnalyzeRequest, ChangeGuardRequest, SimulateRequest
 from .simulate import PatchError, apply_patch, rebuild_input_rules
 
@@ -234,6 +236,23 @@ def get_decision_map(
         raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
 
     return build_decision_map(result, query)
+
+
+@app.get("/api/analyses/{analysis_id}/redundant-rules")
+def get_redundant_rules(analysis_id: str) -> dict[str, Any]:
+    """Inventory the rules that can be individually deleted without effect.
+
+    Every rule of the saved version is removed in turn, the longest-prefix
+    analysis is recomputed on the remainder, and the final effective actions
+    (``permit``/``deny``/``none``) are compared against the original version
+    for both address families.  A rule is ``safe_to_remove`` only when no
+    address changes action; ``changed_addresses`` is the exact number of
+    addresses whose action would change.  Read-only: nothing is persisted.
+    """
+    result = db.get_analysis(analysis_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+    return redundant_rule_inventory(result)
 
 
 @app.get("/api/analyses/{analysis_id}/export.json")

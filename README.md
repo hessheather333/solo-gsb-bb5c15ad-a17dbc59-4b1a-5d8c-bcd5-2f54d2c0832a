@@ -99,6 +99,7 @@ N 的实际覆盖碎片。
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
 | GET | `/api/analyses/{id}/findings` | 查询发现：`severity=conflict/warning/info`、`behavioral_only=true` |
 | GET | `/api/analyses/{id}/decision-map?cidr=...` | 只读的 **CIDR 决策地图**：把查询网段切成最小 CIDR 分块，给出最终动作/胜出规则/完整匹配链 |
+| GET | `/api/analyses/{id}/redundant-rules` | **冗余规则盘点**：逐条移除规则并重算 LPM 裁决，标记可安全删除的规则（**不落库**） |
 | GET | `/api/analyses/{id}/export.json` | 以附件形式导出完整结果 JSON |
 | GET | `/api/analyses/{base}/diff/{target}` | 两个已保存版本的**最终生效动作语义差异**（最小 CIDR + 分类计数） |
 | POST | `/api/analyses/{base}/change-guard/{target}` | **变更守卫**：用调用方给出的授权条目核对两版本的语义差异，返回是否通过及未授权的最小 CIDR |
@@ -359,6 +360,47 @@ curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/decision-map?cid
   （先校验查询参数，再查版本）；缺少 `cidr` 参数 → `422`；
 - 版本不存在 → `404`。
 
+### 冗余规则盘点（redundant rules）
+
+`GET /api/analyses/{id}/redundant-rules` 盘点已保存版本中**哪些规则可以单独删除**：
+对每条规则，服务端把它从规则集中移除、对剩余规则**重新执行最长前缀裁决**，再与
+原版本逐地址比较 IPv4/IPv6 的**最终生效动作**（`permit`/`deny`/`none`，与版本语义
+差异同一套几何算法，不枚举地址）。只有**所有地址的动作都不变**时才标记
+`safe_to_remove: true`——绝不只凭 `shadowed` 状态或同动作重叠直接推断：
+
+- 完全遮蔽的规则总是可安全删除；但**未遮蔽**的规则也可能安全——例如它的整个范围
+  恰好落回一个同动作祖先（`permit /8` 里的 `permit /16`）；
+- 反过来，删除同 CIDR 的 **winner** 会让落选的 duplicate 接管整个网段，删除动作
+  不同的祖先也会让后代范围改变动作——只有重算后的逐地址比较能覆盖这些情形。
+
+每条规则按**原提交顺序**返回 `rule_id`、`safe_to_remove` 和精确的变更地址数
+`changed_addresses`（IPv4 + IPv6 合计，IPv6 大整数精确给出）；单规则版本同样给出
+正确结果（删除唯一规则后其全部范围变为 `none`）。盘点是**只读**的：不新建分析
+版本、不写库，可安全重复调用。
+
+```bash
+curl -s "http://localhost:8080/api/analyses/an_e38b58f57faf2325/redundant-rules"
+```
+
+响应（上文 `dc-2026-09` 示例版本：每条规则都承载着至少一段地址的裁决）：
+
+```json
+{
+  "analysis_id": "an_e38b58f57faf2325",
+  "ruleset_hash": "e38b58f5...",
+  "analyzer_version": "1.0.0",
+  "summary": {"rule_count": 4, "safe_to_remove_count": 0},
+  "rules": [
+    {"rule_id": "r1", "safe_to_remove": false, "changed_addresses": 16711680},
+    {"rule_id": "r2", "safe_to_remove": false, "changed_addresses": 65280},
+    {"rule_id": "r3", "safe_to_remove": false, "changed_addresses": 256},
+    {"rule_id": "r4", "safe_to_remove": false, "changed_addresses": 79228162514264337593543950336}
+  ]
+}
+```
+
+错误码：版本不存在 → `404`。
+
 ### 版本语义差异（semantic diff）
 
 给定两个**已保存**版本 ID，逐地址比较它们的**最终生效动作**：地址落在某条 winner 规则的
@@ -511,6 +553,7 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 │   ├── diff.py          # 版本语义差异：生效动作分区叠加 + 相邻同类范围合并（纯函数，可独立使用）
 │   ├── change_guard.py  # 变更守卫：授权条目解析/并集/重叠校验 + 未授权范围切割（纯函数，可独立使用）
 │   ├── decision_map.py  # 已保存版本的 CIDR 决策地图：查询网段切分 + 匹配链（纯函数，可独立使用）
+│   ├── redundant.py     # 冗余规则盘点：逐条移除 + 重算 LPM + 语义差异比较（纯函数，可独立使用）
 │   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── schemas.py       # Pydantic v2 请求/响应模型
 │   ├── db.py            # SQLite 持久层（analyses / rules / findings 三表）
@@ -519,6 +562,7 @@ curl -s -X POST http://localhost:8080/api/analyses/an_0a34f5ffbbdcf273/change-gu
 ├── tests/test_diff.py          # 语义差异端点测试
 ├── tests/test_change_guard.py  # 变更守卫端点测试
 ├── tests/test_decision_map.py  # CIDR 决策地图端点测试
+├── tests/test_redundant_rules.py # 冗余规则盘点端点测试
 ├── tests/test_simulate.py      # 规则变更预演端点测试
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
