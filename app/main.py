@@ -9,6 +9,7 @@ GET    /api/analyses/{id}                    fetch one version with the full res
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
 GET    /api/analyses/{id}/findings           query findings (filters: severity/behavioral_only)
 GET    /api/analyses/{id}/decision-map       CIDR decision map of this version (query: cidr)
+GET    /api/analyses/{id}/redundant-rules    per-rule safe-to-delete inventory of this version
 GET    /api/analyses/{id}/export.json        download the result as a JSON file
 GET    /api/analyses/{id}/diff/{oid}         effective-action semantic diff of two versions
 POST   /api/analyses/{id}/change-guard/{oid} authorize the semantic diff against caller-supplied grants
@@ -31,6 +32,7 @@ from . import db
 from .change_guard import ChangeGuardError, guard_changes, parse_guard_entries
 from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
+from .redundant_rules import inventory_redundant_rules
 from .schemas import AnalyzeRequest, ChangeGuardRequest, SimulateRequest
 from .simulate import PatchError, apply_patch, rebuild_input_rules
 
@@ -183,9 +185,33 @@ def simulate_changes(analysis_id: str, req: SimulateRequest) -> dict[str, Any]:
     }
 
 
+@app.get("/api/analyses/{analysis_id}/redundant-rules")
+def get_redundant_rules(analysis_id: str) -> dict[str, Any]:
+    """Inventory rules that can be deleted without changing forwarding.
+
+    Each rule of the saved version is removed individually, the ruleset is
+    re-analysed, and the result is compared with the base version by its
+    final effective action on every IPv4/IPv6 address
+    (``permit``/``deny``/``none``).  A rule is ``safe_to_remove`` only when
+    no address changes action; shadowed status or same-action overlap alone
+    is never treated as proof.  Read-only: no new version is stored.
+    """
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    verdicts = inventory_redundant_rules(base)
+    return {
+        "analysis_id": analysis_id,
+        "ruleset_hash": base.get("ruleset_hash"),
+        "rule_count": len(verdicts),
+        "safe_to_remove_count": sum(1 for v in verdicts if v["safe_to_remove"]),
+        "rules": verdicts,
+    }
+
+
 @app.get("/api/analyses/{analysis_id}/rules")
-def get_rules(
-    analysis_id: str,
+def get_rules(    analysis_id: str,
     status: str | None = Query(default=None, pattern="^(active|partial|shadowed)$"),
     action: str | None = Query(default=None, pattern="^(permit|deny)$"),
     ip_version: int | None = Query(default=None, alias="ip", ge=4, le=6),
